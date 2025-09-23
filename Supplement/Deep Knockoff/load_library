@@ -1,0 +1,12 @@
+ml python/3.9.0
+ml py-numpy/1.20.3_py39
+ml py-pytorch/1.8.1_py39
+ml py-pandas/1.3.1_py39
+
+# try these
+ml python/3.6.1
+ml py-numpy/1.14.3_py36
+ml py-scipy/1.1.0_py36
+ml py-pytorch/1.0.0_py36
+ml py-pandas/0.23.0_py36
+
