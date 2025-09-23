@@ -1,0 +1,1402 @@
+---
+title: "Real data analysis"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(genio)
+library(tidyverse)
+library(glmnet)
+library(ggpubr)
+```
+
+This document contains all the code used to analyse the PAISA data using the tilted knockoff method. We analyze three secondary phenotypes: EID, ATT, and PS. For each of these traits we separately analyze two measures: accuracy and speed. The observed values are turned into binary by setting the top 20% as 1 and the rest as 0.
+
+```{r, all_diagnoses}
+diagnoses <- c("BP1", "BP2", "MDD", "SCZ","Control")
+phenos <- c("EID_A_Binary", "EID_S_Binary", "ATT_A_Binary", "ATT_S_Binary", "PS_A_Binary", "PS_S_Binary")
+```
+
+```{r, knockoff_setting}
+m <- 3 # number of multiple knockoffs
+q <- 0.3 # FDR level
+```
+
+## Pre-processing the genotype data
+
+```{r data_dir}
+data_dir <- "/Users/qianzhao/Documents/Research/TiltedKnockoff/Data/"
+```
+
+Because the raw data is large (containing all the SNPs), we first obtain a subset of data containing the SNPs that have been found to be related to severe mental illnesses in previous studies.
+
+### Extract the SNP names
+
+First, I identify a list of candidate SNPs, these are the SNPs that have been found to be associated with at least one of the diagnosis.
+
+```{r get_snp_names}
+geno <- read_plink(file = paste0(data_dir, "9KSmallSNP11282023/GWASIndexSNPs"))
+snp_names <- geno$bim
+```
+
+The list of SNP names is stored in the file `snp_names_12042023.csv`.
+
+### Extract relevant SNPs from the raw data
+
+Next, I extract measurements at these relevant SNPs for each individual. The following step uses Julia language.
+
+```{julia}
+# Using julia code to get data 
+using SnpArrays
+using DelimitedFiles
+using CSV
+using DataFrames
+
+# read snp names
+df= CSV.read("/home/users/qzhao1/paisa/collider/real/snp_names_12042023.csv", DataFrame)
+
+# location of the genotype data  
+paisa_dir = "/oak/stanford/groups/candes/PAISA_new/" # original data (before QC)
+des_dir = "/oak/stanford/groups/candes/PAISA/" # destination
+
+chr = collect(1:22)
+
+for i = 1:22
+  # create row/col index
+  xdata = SnpData(joinpath(paisa_dir, "chr" * string(chr[i])))
+  
+  # positions
+  pos = filter(:chr => name -> name == chr[i], df).pos
+  
+  # create row/col indices to keep 
+  snp_idx = indexin(pos, xdata.snp_info[!, "position"]) |> Vector{Int}
+  
+  # destination file names
+  src = joinpath(paisa_dir, "chr" * string(chr[i]))
+  des = joinpath(des_dir, "chr" * string(chr[i]) *"small") # plink file name 
+  
+  # filter
+  SnpArrays.filter(xdata,  1:9007, snp_idx, des = des)
+end 
+
+# to run a for loop use for ...  end  (https://docs.julialang.org/en/v1/manual/control-flow/#man-loops)
+```
+
+A small data containing the SNPs in each chromosome is created after this step (they are stored in the folder `9KSmallSNPRaw12072023`).
+
+### Concatenate chromosomes to a single data frame
+
+Since raw data was separated into individual chromosomes, we now concatenate data into a single data frame. We use R for this step
+
+```{r concatenate_chromosomes}
+geno_raw <- NULL
+subject_id_raw <- NULL # store the subject ID in chr 1 and then compare with all the other chromosomes to make sure that they all match
+
+for(chr in 1:22){
+  geno_raw_new <- read_plink(file = paste0(data_dir, "9KSmallSNPRaw12072023/chr", chr, "small"))
+  new_bim <- geno_raw_new$bim
+  new_bim$pos <- trimws(new_bim$pos)
+  
+  new_X <- geno_raw_new$X
+  # paste together the genotype name
+  new_snp <-  paste0("X", apply(new_bim[, c("chr", "pos", "alt", "ref")], 1, paste, collapse = "_"))
+  
+  rownames(new_X) <- new_snp
+  if(chr == 1){
+    subject_id_raw <- geno_raw_new$fam$id
+    colnames(new_X) <- subject_id_raw
+  }else{ # check if the individual ids match
+    if(!identical(geno_raw_new$fam$id,subject_id_raw)) cat("Subject ID are different in chr", chr, "!")
+  }
+  
+  geno_raw <- rbind(geno_raw, new_X)
+}
+
+geno_raw <- as.data.frame(geno_raw)
+```
+
+In the `geno_raw` data, each column contains the SNPs of an individual. The column names are individual IDs in the raw data. I map the individual IDs to their Paisa ID in the next step.
+
+### Map individual IDs to their Paisa ID
+
+```{r, get_id_mapping}
+PaisaIDMapping <- read_delim(paste0(data_dir, "/9KSmallSNP11282023/PaisaIDMapping.txt"),  delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+```
+
+Obtain the PAISA ID fore each individual.
+
+```{r, map_paisa_id}
+mapped_bid <- tibble(
+  bid = colnames(geno_raw)
+) %>% 
+  left_join(PaisaIDMapping, by =  c("bid" = "BID")) 
+```
+
+Replace the ID in raw data with their Paisa ID.
+
+```{r, replace_id}
+colnames(geno_raw) <- mapped_bid$PaisaID
+geno_raw <- geno_raw[,which(!is.na(colnames(geno_raw)))]
+geno_raw <- t(geno_raw)
+geno_raw <- as.data.frame(geno_raw)
+geno_raw$PaisaID <- rownames(geno_raw)
+```
+
+### Remove related individuals
+
+We remove related individuals in the data, the remaining individuals are maximally related as first degree cousin in the data.
+
+```{r, remove_id}
+id_toremove <- scan(paste0(data_dir, "9KPhenoData/ID_ToRemove/HaveCNB.Out_toRemove.txt"))
+
+geno_raw <- geno_raw %>% 
+  filter(!PaisaID %in% id_toremove)
+```
+
+### Store raw data
+
+This raw data is stored at `Processed/processed_data/geno_raw.txt`
+
+```{r, store_geno_raw}
+write.table(geno_raw, paste0(data_dir,  "Processed/processed_data/geno_raw.txt"),row.names = F, col.names = T)
+```
+
+### Remove highly correlated SNPs
+
+To increase power of the knockoff approach, we remove highly correlated SNPs from the data.
+
+#### Load raw genotype data
+
+We start from the raw genotype data from previous step.
+
+```{r, load_geno_raw}
+geno_raw <- read.table(paste0(data_dir, "Processed/processed_data/geno_raw.txt"), header = T)
+```
+
+#### Find pairs of SNPs with higher correlation
+
+We set the threshold of correlation among pairs of SNPs to be $\rho = 0.8$. Suppose multiple SNPs are correlated with $\rho > 0.8$, we pick one representative among the group. For example, if SNP1 and SNP2, SNP2 and SNP3 have correlation above the threshold, we pick one representative among the three SNPs.
+
+```{r}
+thresh <- 0.8
+```
+
+```{r, pairwise_corr}
+# compute pairwise correlations
+geno_raw_no_id <- select(geno_raw, -PaisaID)
+snp_names <- colnames(geno_raw_no_id)
+snp_corr <- cor(geno_raw_no_id, geno_raw_no_id, use = "everything") %>%
+  as_tibble()
+snp_corr <- snp_corr %>%  mutate(snp1 = colnames(snp_corr)) %>% 
+  pivot_longer(cols = 1:ncol(snp_corr), names_to = "snp2", values_to = "corr") 
+
+snp_corr_large <- snp_corr%>% 
+  filter(snp1 != snp2)  %>% # remove rows that are the same 
+  filter(corr > thresh) 
+```
+
+There are `r nrow(snp_corr_large)` above the threshold.
+
+#### Merge multiple pairs into groups
+
+```{r}
+corr <- snp_corr_large
+candidates <- sort(unique(c(snp_corr_large$snp1, snp_corr_large$snp2))) # indices of the SNPs that have strong correlations with each other 
+
+group_list <- list()
+ngroups <- 1
+
+j <- 1 # index within a group
+curr_snp <- candidates[1]
+group_list[[ngroups]] <- curr_snp
+
+flag <- F
+while(1){
+  # which candidates are related to the current snp
+  indices <- which(corr$snp1 == curr_snp | corr$snp2 == curr_snp)
+  if(length(indices) > 0){
+    related_snp <- setdiff(c(corr$snp1[indices], corr$snp2[indices]), i)
+    corr <- corr[-indices, ]
+        
+    # add this snp to the current group  
+    group_list[[ngroups]] <- c(group_list[[ngroups]], setdiff(related_snp, group_list[[ngroups]]))
+  }
+  
+  j <- j + 1
+  if(j > length(group_list[[ngroups]])){ # are any new SNPs added to the group? 
+    ngroups <- ngroups +1
+    j <- 1
+    curr_snp <- setdiff(candidates, unlist(group_list))[1]
+    if(is.na(curr_snp)){
+      flag = T
+    }else{
+      group_list[[ngroups]] <- curr_snp
+    }
+  }else{
+    curr_snp <- group_list[[ngroups]][j]
+    cat(curr_snp, ",")
+  }
+  if(flag == TRUE) break;
+}
+```
+
+#### Pick the first SNP in each group as the representative
+
+```{r, snp_to_remove}
+snp_to_remove <- lapply(group_list, function(t) return(t[-1])) %>% unlist() # remove SNPs that are not representatives 
+
+snp_to_keep <- setdiff(snp_names, snp_to_remove)
+```
+
+Store the SNPs for analysis.
+
+```{r}
+write.table(snp_to_keep, paste0(paste0(data_dir, "Processed/processed_data/snp_to_keep_0318.txt")), row.names = F, col.names = F)
+```
+
+Prune the genotype data to include only SNPs we keep for analysis.
+
+```{r, store_geno_pruned}
+geno_pruned <- select(geno_raw, all_of(snp_to_keep), PaisaID)
+
+write.table(geno_pruned, paste0(data_dir, "Processed/processed_data/geno_pruned_0318.txt"), quote = F, row.names = F, col.names = T)
+```
+
+### List of SNPs affecting each diagnosis
+
+We compute SNPs that has been found in previous research to be associated to each diagnosis. For SNPs in a group, I replace them with the representative SNP.
+
+```{r, load_effect_sizes}
+EffectSizeIndexSNPs <- read_table(paste0(data_dir, "9KSmall01112024/EffectSizeIndexSNPs.txt"))
+```
+
+```{r}
+snp_to_keep <- read.table(paste0(data_dir, "Processed/processed_data/snp_to_keep_0318.txt"))$V1
+```
+
+```{r, snp_per_diagnosis}
+for(diagnosis in diagnoses){
+  if(diagnosis %in% c("BP1", "BP2")){
+    snp_diagnosis <- EffectSizeIndexSNPs %>% filter(GWAS_file == "BD") %>% pull(sigSNPS)
+  }else{
+    snp_diagnosis <- EffectSizeIndexSNPs %>% filter(GWAS_file == diagnosis) %>% pull(sigSNPS)
+  }
+  
+  snp_diagnosis <- paste0("X", snp_diagnosis)
+  
+  signal_snp_rep <- NULL
+  for(i in 1:length(group_list)){
+    if(length(intersect(snp_diagnosis, group_list[[i]]))!=0){
+      signal_snp_rep <- c(signal_snp_rep, group_list[[i]][1])
+    }
+  }
+  
+  snp_diagnosis <- intersect(snp_diagnosis, snp_to_keep) # removes non-representative SNPs in a group
+  snp_diagnosis <- unique(c(snp_diagnosis, signal_snp_rep)) # add group representatives 
+  
+  # store the signal SNPs for each diagnosis 
+  write.table(snp_diagnosis, paste0(data_dir, "Processed/processed_data/snp_diagnosis_", diagnosis, "_0318.txt"), row.names = F, col.names = F)
+}
+```
+
+## Knockoff selection (without adjustment)
+
+### Obtain one data set for each phenotype
+
+We remove rows with missing secondary phenotype values. Since we analyze the secondary phenotypes one at a time, each data could contain different individuals depending on which phenotype is missing.
+
+```{r, load_cnb_phenotype}
+geno <- read.table(paste0(data_dir, "Processed/processed_data/geno_pruned_0318.txt"), header = T)
+# secondary phenotype 
+cnb <- read_table(paste0(data_dir, "9KPhenoData/Binary_CNB_ForQian.txt"))
+# diagnosis  
+dx <- read_delim(paste0(data_dir, "9KPhenoData/PhenoData.txt"),  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>% select(PaisaID, DX) 
+id_toremove <- scan(paste0(data_dir, "9KPhenoData/ID_ToRemove/HaveCNB.Out_toRemove.txt"))
+```
+
+```{r,individual_diagnosis_data}
+for(pheno in phenos){
+  data <- left_join(geno, select(cnb, c(PaisaID, {{pheno}})), by = "PaisaID") %>% 
+    filter(!PaisaID %in% id_toremove) %>% 
+    filter_at(vars({{pheno}}), all_vars(!is.na(.))) %>% 
+    left_join(dx, by = "PaisaID") 
+  
+  write.table(data, paste0(data_dir, "Processed/data_pheno/", pheno, "_0318.txt"), row.names = F, col.names = T)
+}
+```
+
+### Construct second-order knockoffs
+
+In order to construct second-order knockoffs, we need to estimate the population mean $\mu_\mathrm{pop}$ and covariance matrix $\Sigma_\mathrm{pop}$. We use our sample to compute an estimate of mean $\mu_d$ and covariance $\Sigma_d$ for each diagnosis $d$ and compute a weighted average based on incidence of each diagnosis.
+
+#### Estimate mean and covariance for each diagnosis
+
+We assume the covariance is block-diagonal, that is, SNPs on different chromosomes are independent of each other.
+
+```{r, cov_diagnosis}
+snp_names <- read.table(paste0(data_dir, "Processed/processed_data/snp_to_keep_0318.txt"), header = F)[,1]
+
+geno_pruned <- read_table(paste0(data_dir, "Processed/processed_data/geno_pruned_0318.txt"))
+  
+
+for(diagnosis in diagnoses){
+  # which individual has this diagnosis
+  dat <- left_join(geno_pruned, dx, by = "PaisaID") %>% 
+      filter(DX == {{diagnosis}} ) %>% 
+      select(-c(PaisaID, DX))
+  
+  cov_mat_diag <- list()
+  for(chr in 1:22){
+    mat <- select(dat, starts_with(paste0("X", chr,"_")))
+    
+    cov_mat <- cov(mat, mat, use = "everything")
+    
+    cov_mat_diag[[chr]] <- cov_mat
+  }
+  
+  mu <- data.frame(snp_names = colnames(dat), mu = colMeans(dat))
+
+  cov <- as.matrix(bdiag(cov_mat_diag))
+  colnames(cov) <- snp_names
+  rownames(cov) <- snp_names
+  
+  
+  write.table(mu, paste0(data_dir, "Processed/vcov/mu_", diagnosis, "_0318.txt"), row.names = T, col.names = T)
+  write.table(cov, paste0(data_dir, "Processed/vcov/cov_", diagnosis, "_0318.txt"), row.names = T, col.names = T)
+}
+```
+
+#### Population mean and covariance
+
+We assume here that the incidence of BP1 and BP2 as equal, noting that this estimate is not correct.
+
+```{r, compute_pop_mean_cov}
+for(diagnosis in diagnoses){
+  assign(paste0("mu_", diagnosis), read.table(paste0(data_dir, "Processed/vcov/mu_", diagnosis, "_0318.txt"), header = T)$mu)
+  
+  assign(paste0("cov_", diagnosis), read.table(paste0(data_dir, "Processed/vcov/cov_", diagnosis, "_0318.txt"), header = T))
+}
+
+mu_pop <- mu_BP1 * 219 / 100000 / 2 + mu_BP2 * 219 / 100000 / 2 + mu_MDD * 235 / 100000 + mu_SCZ * 45 / 100000 + mu_Control * (100000 - 219 - 235 - 45) / 100000
+
+cov_pop <- cov_BP1 * 219 / 100000 / 2 + cov_BP2 *  219 / 100000 / 2 + cov_MDD * 235 / 100000 + cov_SCZ *  45 / 100000 + cov_Control *  (100000 - 219 - 235 - 45) / 100000
+```
+
+```{r, store_pop_mean_cov, echo = F, eval = F}
+write.table(mu_pop, paste0(data_dir, "Processed/vcov/mu_pop_0318.txt"), row.names = F, col.names = T)
+  
+write.table(cov_pop, paste0(data_dir, "Processed/vcov/cov_pop_0318.txt"), row.names = T, col.names = T)
+
+sd_pop <- sqrt(diag(cov_pop))
+corr_pop <- cov_pop / (sd %*% t(sd))
+
+write.table(corr_pop, paste0(data_dir, "Processed/vcov/corr_pop_0318.txt"), row.names = F, col.names = F)
+```
+
+#### Solve for the diagonal matrix for each covariance matrices
+
+The covariance matrix of the multiple knockoff has form
+
+$$
+\Sigma_{m} = \left(\begin{matrix}
+\Sigma & \Sigma - D & \ldots & \Sigma - D \\
+\Sigma - D & \Sigma & \ldots & \Sigma - D \\
+\vdots & \vdots & \ddots & \vdots \\
+\Sigma-D & \Sigma - D & \ldots & \Sigma
+\end{matrix}\right)
+$$ where $D$ is a diagonal matrix which ensures low correlation between a variable and its knockoff. We use two approaches to compute $D$, the MVR knockoff (see article [Powerful knockoffs via minimizing reconstructability](https://lucasjanson.fas.harvard.edu/papers/Powerful_Knockoffs_Via_Minimizing_Reconstructability-Spector_Janson-2020.pdf) by Spector and Janson) and the ME knockoff (see article [Improving the stability of the knockoff procedure: Multiple Simultaneous knockoffs and entropy maximization](https://proceedings.mlr.press/v89/gimenez19b/gimenez19b.pdf) by Gimenez and Zou). We first convert the covariance to correlation matrix and solve the optimization problem as described in the two articles.
+
+```{r, compute_corr}
+for(diagnosis in diagnoses){
+  cov <- read.table(paste0(data_dir, "Processed/vcov/cov_", diagnosis, "_0318.txt")) %>% as.matrix()
+  sd <- sqrt(diag(cov))
+  corr <- cov / (sd %*% t(sd))
+  write.table(corr, paste0(data_dir, "Processed/vcov/corr_", diagnosis, "_0318.txt"), row.names = F, col.names = F)
+}
+```
+
+```{julia, solve_diag_diagnosis}
+# load julia packages
+using DelimitedFiles
+using CSV
+using DataFrames
+using Knockoffs
+
+dir = "/scratch/users/qzhao1/paisa/real/data/vcov/"
+out_dir = "/scratch/users/qzhao1/paisa/real/data/sol/" 
+
+m = 3; # multiple knockoffs
+
+# load the estimated mu and covariance matrices 
+Σ = readdlm(dir * "corr_pop_0318.txt",' ', Float64, '\n');
+p = size(Σ )[1]
+  
+# create some random X
+X = randn(100, p);
+  
+μ = zeros(p);
+  
+# maximum entropy knockoff
+me_multiple = modelX_gaussian_knockoffs(X, :maxent, μ , Σ, m=m);
+# mvr knockoff
+mvr_multiple = modelX_gaussian_knockoffs(X, :mvr, μ, Σ, m = m);
+# equal correlation knockoff 
+equi_multiple = modelX_gaussian_knockoffs(X, :equi, μ, Σ, m = m);
+  
+# concatenate solutions into a matrix
+sol = hcat(me_multiple.s, mvr_multiple.s, equi_multiple.s);
+  
+# save the diagonal terms 
+writedlm(out_dir * "sol_pop_0318.txt", sol)
+```
+
+#### Compute conditional distribution of the knockoffs
+
+Given the diagonal matrix $D$, the mean $\mu_\textrm{pop}$ and covariance $\Sigma_\textrm{pop}$, we now compute the conditional distribution of the knockoff $\tilde{X}$ given observed data $X$ using the function below. The formula is given in Gimenez and Zou (2019):
+
+$$
+(\tilde{X}^1,\ldots, \tilde{X}^m) \,|\, X \sim N((\tilde{\mu},\ldots, \tilde{\mu}), \tilde{\Sigma}),
+$$ where
+
+$$
+\tilde{\Sigma} = \left(\begin{matrix}
+C & C - D  & C - D \\
+C - D & C & C - D\\
+C - D & C - D & C
+\end{matrix}\right),
+\quad 
+C = 2D - D\Sigma^{-1}D. 
+$$
+
+```{r,fun_get_knockoff_mean_cov}
+# INPUT
+# X -- the data matrix 
+# cov -- the covariance matrix
+# mu -- the vector of the means
+# diag -- the solution of the optimization problem 
+# 
+# OUTPUT
+# mu_tilde -- mean of the knockoffs 
+# r_tilde -- covariance matrix for the knockoffs 
+knockoff_mean_cov <- function(X, cov, mu, sol){
+  m <- 3 # 3 multiple knockoffs
+  sd <- sqrt(diag(cov)) # compute std
+  SigmaInv <- solve(cov)
+  p <- ncol(cov)
+      
+  sol <- sol * sd^2 # convert the solution back to the covariance 
+      
+  mu_tilde <- list()
+  r_tilde <- list()
+  for(i in 1:2){ # use the ME and MVR knockoffs 
+    # compute the adjusted matrix Sigma-tilde 
+    D <- diag(sol[,i])
+    C <- 2 * D - D %*% (SigmaInv %*% D)
+    
+    # 3 multiple knockoffs 
+    SigmaTilde <- rbind(cbind(C, C - D, C - D), cbind(C - D, C , C-D), cbind(C - D, C - D, C))
+    # Compute the eigenvalues, if there's an eigen value that is less than eps, print that value out, and turn it to eps
+    svd <- eigen(SigmaTilde)
+    eigenvalue <- svd$values
+    eps <- 0.0005
+    if(min(eigenvalue) < eps){
+      cat(eigenvalue[which(eigenvalue < eps)])
+      eigenvalue[which(eigenvalue < eps)] <- eps
+      SigmaTilde <- svd$vectors %*% (diag(eigenvalue) %*% t(svd$vectors))
+    }
+    
+    # store the adjusted covariance matrix 
+    RTilde <- chol(SigmaTilde)
+        
+    # compute the mean term 
+    MuTilde0 <- as.vector(D %*% (SigmaInv %*% mu)) + (diag(p) - D %*% SigmaInv) %*% t(X)
+    MuTilde <- do.call(rbind, replicate(m, MuTilde0, simplify=FALSE))
+    
+    mu_tilde[[i]] <- MuTilde
+    r_tilde[[i]] <- RTilde
+  }
+  
+  return(list(mu_tilde = mu_tilde, r_tilde = r_tilde))
+}
+```
+
+The Cholesky factorization of $\tilde{\Sigma}$ and the mean $\tilde{\mu}$ are stored.
+
+#### Sample knockoffs from the Gaussian distribution
+
+Next, we sample 50 knockoffs (each of these is a multiple knockoff with 3 knockoffs) from the conditional distribution specified above.
+
+```{r}
+B <- 50  # number of multiple knockoffs
+```
+
+```{r}
+for(pheno in phenos){
+  for(method in c("me", "mvr")){
+    cat(pheno, method,  "\n")
+    
+    r_tilde <- read.table(paste0(data_dir, "ProcessedData/TiltedCov/r_tilde_", pheno, "_",method,"_0508.txt")) %>% as.matrix()
+    
+    mu_tilde <-  as.matrix(read.table(paste0(data_dir, "ProcessedData/TiltedCov/mu_tilde_", pheno, "_",method,"_0508.txt")))
+    
+    # sample multivariate Gaussian
+    p <- nrow(r_tilde)
+    n <- ncol(mu_tilde)
+    
+    for(b in 1:B){
+      cat(b, ",")
+      if(b %% 10 == 0) cat("\n")
+      xtilde <- matrix(rnorm(n * p), n, p) %*% r_tilde + t(mu_tilde)
+      write.table(xtilde, paste0(data_dir, "ProcessedData/Knockoffs/xtilde_", pheno, "_",method,"_", b, ".txt"))
+    }
+  }
+}
+```
+
+### Select variables
+
+#### Functions for selection
+
+We fit a regularized logistic regression and use the largest $\lambda$ such that a variable enters the model as the test statistics. Another option is the absolute value of the coefficient at the most regularized model such that the cross-validated error is within one standard error of the minimum. We select variables using the algorithm described in Gimenez and Zou (2019).
+
+```{r, fun_lasso_lambda_max_bin}
+# Compute lasso_lambda_max statistics 
+# INPUT:
+# X -- the covariate matrix of size n * p
+# Xtilde -- the knockoffs of matrix size n * (3 * p)
+# Y -- response variable in 0 or 1
+# nlambda -- number of regularization parameters
+# OUTPUT:
+# the largest lambda where each variable shows up (to get nonzero coef)
+lasso_lambda_max_bin <- function(X, XTilde, Y, nlambda = 2e3){
+  # fit lasso
+  fit <- glmnet(x = cbind(X, XTilde), y = Y, family = "binomial", nlambda = nlambda, intercept = T, standardize = T)
+  
+  # extract where each coefficient is not zero
+  first_nonzero <- function(x) match(T, abs(x) > 0) # NA if all(x==0)
+  indices <- apply(fit$beta, 1, first_nonzero)
+  # return the list of lambda_max  
+  ifelse(is.na(indices), 0, fit$lambda[indices])
+}
+```
+
+```{r, fun_lasso_coef_bin}
+# Compute absolute value of the lasso coef 
+# INPUT:
+# X -- the covariate matrix of size n * p
+# Xtilde -- the knockoffs of matrix size n * (3 * p)
+# Y -- response variable in 0 or 1
+# OUTPUT:
+# vector of lasso coef at the lambda that is 1 std away from the value that minimizes the CV error
+lasso_coef_bin <- function(X, XTilde, Y){
+  # fit lasso
+  cvfit <- cv.glmnet(x = cbind(X, XTilde), y = Y, family = "binomial", 
+                     intercept = T, standardize = T, type.measure = "class")
+  
+  # return coefficients (remove the intercept)
+  coef(cvfit, s = "lambda.1se")[-1]
+}
+```
+
+```{r, fun_multiple_knockoff_selection}
+# Select variables using multiple knockoffs 
+# INPUT:
+# X -- the covariate matrix
+# XTilde -- the knockoff matrix
+# Y -- response
+# stat -- statistics to use for Tj, "lasso_lambda_max_bin" or "lasso_coef"
+# OUTPUT:
+# a list of selections at a vector of FDR levels q 
+select_vars_multi_knockoff <- function(X, XTilde, Y, kappa = 3, q, stat = "lasso_lambda_max_bin"){
+  if(stat == "lasso_lambda_max_bin"){
+    stat <- lasso_lambda_max_bin(X, XTilde, Y, nlambda = 2e3)
+  }else if(stat == "lasso_coef"){
+    stat <- lasso_coef_bin(X, XTilde, Y)
+  }
+  
+  stat <- matrix(stat, nrow = kappa + 1, byrow = T) # arrange into rows (one row is one copy of the original covariate or knockoff)
+  stat_sorted <- apply(stat, 2, function(t) sort(t, decreasing = T))
+  tau <- stat_sorted[1, ] - stat_sorted[2, ]
+  
+  sorted_tau <- sort(tau)
+  kappa_val <- apply(stat, 2, which.max) == 1
+  
+  fdp_hat <- sapply(sorted_tau, 
+                    function(t) {
+                      (1 / kappa + 1/kappa * sum((tau >= t) * (1-kappa_val))) / max(1, sum((tau >= t)*kappa_val))
+                    }
+  )
+
+  if(min(fdp_hat) <= q){
+    threshold <- sorted_tau[min(which(fdp_hat <= q))]
+  }else{
+    threshold <- NA
+  }
+
+  if(!is.na(threshold)){
+    selected <- which(tau >= threshold & kappa_val == 1)
+  }else{
+    selected <- numeric(0)
+  }
+  
+  stat_diff <- stat[1, ] - apply(stat[-1, ], 2, max)
+  return(
+    list(selected = selected,
+         stat_diff = stat_diff)
+  )
+}
+```
+
+### Compute knockoff selections for each secondary phenotype
+
+We compute knockoff selections at FDR level $q = 0.3$.
+
+```{r}
+q <- 0.3  # FDR threshold 
+```
+
+```{r}
+selection_unadjusted <- list()
+stat_unadjusted <- list()
+
+snp_names <- read.table(paste0(data_dir, "ProcessedData/Data/snp_to_keep_0318.txt"), header = F)[,1]
+for(pheno in phenos){
+  data <- read.table(paste0(data_dir, "ProcessedData/PhenoData/", pheno, "_0318.txt"), header = T) %>% filter(.data[[pheno]] != -9)  
+  
+  X <- select(data, -c(PaisaID, DX, {{pheno}}))
+  Y <- pull(data, {{pheno}})
+  
+  
+  for(method in c("me", "mvr")){
+    cat(pheno, method, ":\n")
+    
+    new_selections <- list()
+    new_stats <- list()
+    for(b in 1:B){
+      XTilde <- read.table(paste0(data_dir, "ProcessedData/Knockoffs/xtilde_", pheno, "_",method,"_", b, ".txt")) %>% as.matrix()
+      
+      new_selection <- select_vars_multi_knockoff(X, XTilde, Y, kappa = 3, q, stat = "lasso_lambda_max_bin")
+      new_selections[[b]] <- snp_names[new_selection$selected]
+      new_stats[[b]] <- new_selection$stat 
+      
+      cat(b, ":", snp_names[new_selection$selected], "\n")
+    }
+    
+    new_name <- paste0(pheno, "_", method)
+    selection_unadjusted[[new_name]] <- new_selections
+    stat_unadjusted[[new_name]] <- new_stats
+  }
+}
+
+# save results 
+saveRDS(selection_unadjusted, file = paste0(data_dir, "ProcessedData/Selection/knockoff.rds"))
+saveRDS(stat_unadjusted, file = paste0(data_dir, "ProcessedData/Selection/stat.rds"))
+```
+
+## Tilted knockoff selections
+
+### Estimating the tilted distribution
+
+In order to apply the tilted knockoff method, we first need to estimate $P_y(d\,|\, X)$ for each secondary phenotype $y$, diagnosis $d$ and genotype $X$.
+
+#### Construct a data set for each diagnosis and phenotype
+
+We compile a data set for each diagnosis $d$ and secondary phenotype $y$. The data set consists of individuals with that diagnosis $d$ and controls. This data excludes individuals with NA values in the secondary phenotype.
+
+```{r, load_geno_pruned_for_estimating_tilted_dist}
+geno_pruned <- read.table(paste0(data_dir, "Processed/processed_data/geno_pruned_0318.txt"), header = T)
+cnb <- read_table(paste0(data_dir, "9KPhenoData/Binary_CNB_ForQian.txt"))
+dx <- read_delim(paste0(data_dir, "9KPhenoData/PhenoData.txt"),  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>% select(PaisaID, DX)
+id_toremove <- scan(paste0(data_dir, "9KPhenoData/ID_ToRemove/HaveCNB.Out_toRemove.txt"))
+```
+
+```{r}
+# obtain a data frame for each phenotype and diagnosis 
+for(diagnosis in diagnoses){
+  for(pheno in phenos){
+    cat(diagnosis, pheno, "\n")
+    data <- left_join(geno_pruned, select(cnb, c(PaisaID, {{pheno}})), by = "PaisaID") %>% 
+      filter(!PaisaID %in% id_toremove) %>% 
+      filter_at({{pheno}}, all_vars(.!=-9)) %>% 
+      left_join(dx, by = "PaisaID") %>% 
+      filter(DX %in% c({{diagnosis}}, "Control")) %>% 
+      mutate(dx = map_dbl(DX, ~ifelse(.x == diagnosis, 1, 0))) %>% 
+      select(-DX)
+  
+    write.table(data, paste0(data_dir, "Processed/est_selection_probs/", diagnosis, "_", pheno, "_05222025.txt"), row.names = F, col.names = T)
+  }
+}
+```
+
+#### Select SNPs related to a diagnosis
+
+We model $P_y(d\,|\, X)$ using a logistic model
+
+$$
+P_y(d\,|\, X) = \sigma(y\,  \gamma_y + X^\top \gamma_x + \gamma_0),\quad \sigma(t) = \frac{1}{1+e^{-t}}. 
+$$
+
+We fit a regularized logistic regression using diagnosis $d$ as the response, and the secondary phenotype value $y$ as well as the genotype $X$ as the covariates. The list of selected variables at $\lambda$ that minimizes the cross validation error is combined with the SNPs previously found to be associated with $d$ to estimate the probability $P_y(d\,|\, X)$. Next, we fit a logistic regression using these selected variables. Since the data is from a case-control sample, we need to adjust the estimated intercept using the population incidence.
+
+The intercept is given by $\hat{\gamma} - log\frac{n_1 \pi_0}{n_0 \pi_1}$, where $\pi_1$ ($\pi_0$) is the incidence of the specific diagnosis (control) in the population and $n_1$ ($n_0$) is the number of case (control) in the sample.
+
+```{r, coef_tilted}
+snp_names <- colnames(select(geno_pruned, -PaisaID))
+
+for(diagnosis in diagnoses){
+  if(diagnosis == "Control") next; 
+  for(pheno in phenos){
+    data <- read.table(paste0(data_dir, "Processed/est_selection_probs/", diagnosis, "_", pheno, "_05222025.txt"), header = T)
+  
+    cvfit <- cv.glmnet(as.matrix(select(data, -c(dx,PaisaID))), pull(data, dx), family = "binomial", type.measure = "class")
+  
+    # which SNPs are selected by the l1 regularized regression
+    lasso_coef <- coef(cvfit, s =  "lambda.min")
+    selected_snp_lasso <- intersect(snp_names, rownames(lasso_coef)[which(lasso_coef != 0)])
+  
+    # print the SNPs selected by LASSO
+    cat(diagnosis, ",", pheno, ":\n")
+    cat("SNPs selected by LASSO", selected_snp_lasso, "\n")
+  
+    # which SNP have known effect to the disease
+    snp_diagnosis <- read.table(paste0(data_dir, "Processed/processed_data/snp_diagnosis_", diagnosis, "_0318.txt"))[,1]
+    
+    # compute the union of these two sets of SNPs
+    snp_lasso <- union(snp_diagnosis, selected_snp_lasso)
+  
+    # Fit a logistic regression using the selected SNPs
+    data_selected <- select(data, all_of(snp_lasso), {{pheno}}, dx)
+  
+    fit <- glm(dx ~ ., data=data_selected, family = "binomial")
+  
+    # compute the adjustment of the intercept 
+    pi1 <- switch(diagnosis, 
+                  BP1 = 219 / 2 / 100000,
+                  BP2 =  219 / 2 / 100000,
+                  MDD = 235 / 100000,
+                  SCZ = 45 / 100000)
+    ncase <- sum(data$dx)
+    ncontrol <- sum(1 - data$dx)
+    adj <- log(ncase * (1-pi1) / ncontrol / pi1) # adjustment of the intercept
+    
+    # adjust the intercept values
+    coef <- fit$coef
+    coef[1] <- coef[1] - adj 
+      
+    # store the fitted coefficients
+    coef_tibble <- tibble(names =  c("Intercept", colnames(select(data_selected, -dx))), coef = coef)
+    write.table(coef_tibble, paste0(data_dir, "Processed/est_selection_probs/coef_", diagnosis, "_", pheno, "_05222025.txt"), row.names = T, col.names = F)
+    }
+}
+```
+
+#### Record the probability for each individual
+
+We now compute the probability $P(D=d\,|\, X, Y)$ for each individual and for each secondary phenotype. These values will be used as weights for the visualization. The weights are scaled by population incidence to avoid unbalanced weights among cases and controls.
+
+```{r}
+snp_names <- read.table(paste0(data_dir, "Processed/processed_data/snp_to_keep_0318.txt"), header = F)[,1]
+geno_pruned <- read.table(paste0(data_dir, "Processed/processed_data/geno_pruned_0318.txt"), header = T)
+cnb <- read_table(paste0(data_dir, "9KPhenoData/Binary_CNB_ForQian.txt"))
+dx <- read_delim(paste0(data_dir, "9KPhenoData/PhenoData.txt"),  delim = "\t", escape_double = FALSE, trim_ws = TRUE) %>% select(PaisaID, DX)
+id_toremove <- scan(paste0(data_dir, "9KPhenoData/ID_ToRemove/HaveCNB.Out_toRemove.txt"))
+
+for(pheno in phenos){
+  for(diagnosis in diagnoses){
+    if(diagnosis != "Control"){
+      coef <- read.table(paste0(data_dir, "Processed/est_selection_probs/coef_", diagnosis, "_", pheno, "_05222025.txt"))
+      
+      coef_long <- numeric(ncol(data) + 1) 
+      names(coef_long) <- c("Intercept", snp_names, pheno)
+      coef_long[match( coef$V2, names(coef_long))] <- coef$V3
+      
+      write.table(coef_long, paste0(data_dir, "Processed/est_selection_probs/coef_long_", diagnosis, "_", pheno, "_05222025.txt"))
+    }
+  }
+}
+
+
+```
+
+```{r}
+for(pheno in phenos){
+  pheno_data <- NULL
+  for(diagnosis in diagnoses){
+      data <- left_join(geno_pruned, select(cnb, c(PaisaID, {{pheno}})), by = "PaisaID") %>% 
+        filter(!PaisaID %in% id_toremove) %>% 
+        filter_at({{pheno}}, all_vars(.!=-9)) %>% 
+        left_join(dx, by = "PaisaID") %>% 
+        filter(DX %in% {{diagnosis}}) %>%  
+        select(-c(DX, PaisaID))
+      
+    if(diagnosis != "Control"){
+      coef_long <- read.table(paste0(data_dir, "Processed/est_selection_probs/coef_long_", diagnosis, "_", pheno, "_05222025.txt"))$x
+      
+      val <- cbind(1, as.matrix(data)) %*% coef_long
+      weight <- 1 / (1 + exp(-val))
+      
+    }else{
+      weight <- numeric(nrow(data))
+      for(dd in diagnoses){
+        if(dd == "Control") next;
+         coef_long <- read.table(paste0(data_dir, "Processed/est_selection_probs/coef_long_", dd, "_", pheno, "_05222025.txt"))$x
+         val <- cbind(1, as.matrix(data)) %*% coef_long
+        weight <- weight + 1 / (1 + exp(-val))
+      }
+      weight <- 1-weight
+      
+    }
+      
+      pi1 <- switch(diagnosis, 
+                  BP1 = 219 / 2 / 100000,
+                  BP2 =  219 / 2 / 100000,
+                  MDD = 235 / 100000,
+                  SCZ = 45 / 100000,
+                  Control = 0.99501)
+      
+      weight <- weight / pi1
+    
+      data <- cbind(data, weight)
+      pheno_data <- rbind(pheno_data, data)
+  }
+  write.table(pheno_data, paste0(data_dir, pheno, "_weights.txt"), sep = ",")
+}
+```
+
+## Estimate the mean and covariance matrix of the tilted distribution
+
+We now use importance sampling to estimate mean and covariance matrix of the tilted distribution.
+
+```{r, est_tilted_dist_params}
+# Estimate the mean and covariance of the tilted distribution
+library(dplyr)
+
+B <- 50 # number of importance samples
+
+# Functions
+sample_gaussian <- function(n, mu = 0, R){
+  p <- nrow(R)
+  
+  X <- matrix(rnorm(n*p, 0, 1), n, p) %*% R
+  
+  t(t(X) + mu)
+}
+
+pselect <- function(X, Y, params){
+  # select the columns in X that corresponds to the coefficients
+  X1 <- as.matrix(select(as_tibble(X), all_of(names(params$gamma_x)) ))
+  
+  v <- Y * params$gamma_y + X1 %*% params$gamma_x + params$gamma_0
+  
+  probs <- 1 / (1 + exp(-v))
+  
+  probs 
+}
+
+# Set up 
+dir <- "/scratch/users/qzhao1/paisa/real/data/"
+
+# load all the estimated mean, covariance and the coefficients
+mu <- read.table(paste0(dir, "vcov/mu_pop_0318.txt"), header = T)$x
+cov <- read.table(paste0(dir, "vcov/cov_pop_0318.txt")) 
+R_pop <- chol(cov)
+p <- length(mu)
+
+diagnoses <- c("BP1", "BP2", "SCZ","MDD", "Control")
+phenos <- c("EID_A_Binary", "EID_S_Binary", "ATT_A_Binary", "ATT_S_Binary", "PS_A_Binary", "PS_S_Binary")
+
+params <- list()
+for(diagnosis in diagnoses){
+  for(pheno in phenos){
+    # load the estimated parameters 
+    if(diagnosis != "Control"){
+      coef <- read.table(paste0(dir, "est_selection_probs/coef_", diagnosis, "_", pheno, "_0508.txt"), header = F)
+      colnames(coef)[2:3] <- c("name", "coef")
+      
+      gamma_0 <- coef$coef[1]
+      gamma_x <- coef$coef[2:(nrow(coef) - 1)]
+      names(gamma_x) <- coef$name[2:(nrow(coef) - 1)]
+      gamma_y <- tail(coef$coef, 1)
+      
+      params[[diagnosis]] <- list(gamma_0 = gamma_0, gamma_x = gamma_x, gamma_y = gamma_y)
+    }
+  }
+}
+
+for(pheno in phenos){
+  for(y in c(0,1)){
+    for(diagnosis in diagnoses){
+      cat(pheno, y,diagnosis, "\n" )
+      mu_hat <- matrix(NA, B, p)
+      mu2_hat <- array(NA, dim = c(B, p, p))
+      probs_sums <- numeric(B) 
+      
+      for(b in 1:B){
+        cat(b, ",")
+        
+        x_new <- sample_gaussian(n = 5000, mu = mu, R = R_pop)
+        
+        
+        if(diagnosis != "Control"){
+          probs <- pselect(x_new, y, params[[diagnosis]]) 
+          
+        }else{
+          for(dx in diagnoses[1:4]){
+            probs_tot <- numeric(5000)
+            probs_tot <- probs_tot + pselect(x_new, y, params[[dx]]) 
+          }
+          probs <- 1 - probs_tot
+        }
+        
+        probs_sums[b] <- colSums(probs) # sum of pselect
+        mu_hat[b, ] <- t(probs) %*% x_new / sum(probs)
+        P <- diag(as.vector(probs))
+        mu2_hat[b,,] <- as.matrix( t(x_new) %*% (P %*% x_new) / sum(probs))
+      }
+      
+      mu_hat_agg <- t(probs_sums) %*% mu_hat / sum(probs_sums)
+      mu2_hat_agg <- apply(mu2_hat * probs_sums, c(2, 3), sum) / sum(probs_sums)
+      sigma_hat_agg <- mu2_hat_agg- t(mu_hat_agg) %*% mu_hat_agg
+      
+      
+      write.table(mu_hat_agg, paste0(dir, "vcov/mu_hat_",diagnosis, "_", pheno, "_", y, "_05222025.txt"), row.names = F, col.names = F)  
+      write.table(sigma_hat_agg, paste0(dir, "vcov/sigma_hat_",diagnosis, "_", pheno, "_", y, "_05222025.txt"), row.names = F, col.names = F)  
+      
+    }
+  }
+}
+```
+
+### Compute the correlation matrix
+
+We then convert the covariance matrix to correlation matrix and solve for the diagonal term $s$ for knockoff sampling.
+
+```{r, compute_corr}
+dir <- "/Users/zq/qianzhao@umass.edu - Google Drive/My Drive/Research/TiltedKnockoff/Data/"
+for(diagnosis in diagnoses){
+  for(pheno in phenos){
+    for(y in c(0, 1)){
+      cov <- read.table(paste0(dir, "vcov/sigma_hat_", diagnosis, "_", pheno,"_",y, "_05222025.txt")) %>% as.matrix()
+      sd <- sqrt(diag(cov))
+      corr <- cov / (sd %*% t(sd))
+      write.table(corr, paste0(dir, "vcov/corr_", diagnosis, "_", pheno,"_",y,  "_05222025.txt"), row.names = F, col.names = F)
+    }
+  }
+}
+```
+
+#### Solve the diagonal matrix
+
+```{julia, solve_diagonal_tilted }
+# load julia packages
+using DelimitedFiles
+using CSV
+using DataFrames
+using Knockoffs
+
+diagnoses = ["BP1", "BP2", "SCZ","MDD","Control"]
+phenos = ["EID_A_Binary", "EID_S_Binary", "ATT_A_Binary", "ATT_S_Binary", "PS_A_Binary", "PS_S_Binary"]
+
+dir = "/scratch/users/qzhao1/paisa/real/data/vcov/"
+out_dir = "/scratch/users/qzhao1/paisa/real/data/sol/"
+
+m = 3; # multiple knockoffs
+
+for diagnosis in diagnoses
+  for pheno in phenos
+    for y in [0, 1]
+      print(diagnosis, pheno, y)
+      # load the estimated mu and covariance matrices 
+      Σ = readdlm(dir * "corr_" * diagnosis *"_" * pheno * "_" * string(y) *"_0318.txt",' ', Float64, '\n');
+      p = size(Σ )[1]
+      
+      # create some random X
+      X = randn(100, p);
+      
+      μ = zeros(p);
+      
+      # maximum entropy knockoff
+      me_multiple = modelX_gaussian_knockoffs(X, :maxent, μ , Σ, m=m);
+      # mvr knockoff
+      mvr_multiple = modelX_gaussian_knockoffs(X, :mvr, μ, Σ, m = m);
+      # equal correlation knockoff 
+      equi_multiple = modelX_gaussian_knockoffs(X, :equi, μ, Σ, m = m);
+      
+      # concatenate solutions into a matrix
+      sol = hcat(me_multiple.s, mvr_multiple.s, equi_multiple.s);
+      
+      # save the diagonal terms 
+      writedlm(out_dir* "sol_" * diagnosis *"_" * pheno * "_" * string(y) * "_0508.txt", sol)
+    end
+  end
+end
+```
+
+### Compute the mean and covariance matrices of the knockoffs
+
+We compute the conditional distribution $\tilde{X} | X$ using the covariance matrix $\Sigma$ and diagonal matrix $s$.
+
+```{r}
+for(diagnosis in diagnoses){
+  for(pheno in phenos){
+    for(y in c(0, 1)){
+      cat(diagnosis, pheno, y,"\n")
+      
+      data <- read.table(paste0(data_dir, "Processed/data_pheno/", pheno, "_0318.txt"), header = T)
+      X <- data %>% filter(DX == diagnosis, .data[[pheno]] == y) %>% 
+       select(-c({{pheno}}, DX, PaisaID)) %>% 
+       as.matrix()
+     
+      # load the covariance matrix
+      cov <- read.table(paste0(data_dir, "Processed/vcov/sigma_hat_", diagnosis,"_" ,pheno, "_", y, "_0508.txt")) %>% as.matrix()
+      
+      # load the means
+      mu <- scan(paste0(data_dir, "Processed/vcov/mu_hat_", diagnosis, "_",pheno, "_", y, "_0508.txt"))
+  
+      # load the solved diagonal matrix 
+      sol <- read.table(paste0(data_dir, "Processed/sol/sol_", diagnosis,"_" ,pheno, "_", y ,"_0508.txt"))
+     
+      
+      mu_cov_tilded <- knockoff_mean_cov(X, cov, mu, sol)
+      
+      write.table(mu_cov_tilded$mu_tilde[[1]], paste0(data_dir, "Processed/TiltedCov/mu_tilde_", pheno, "_", diagnosis, "_", y, "_me_0508.txt" ) )
+    write.table(mu_cov_tilded$mu_tilde[[2]], paste0(data_dir, "Processed/TiltedCov/mu_tilde_", pheno, "_", diagnosis,"_", y, "_mvr_0508.txt" ) )
+    
+    write.table(mu_cov_tilded$r_tilde[[1]], paste0(data_dir, "Processed/TiltedCov/r_tilde_", pheno, "_", diagnosis,"_", y, "_me_0508.txt" ) )
+    write.table(mu_cov_tilded$r_tilde[[2]], paste0(data_dir, "Processed/TiltedCov/r_tilde_", pheno, "_", diagnosis,"_", y, "_mvr_0508.txt" ) )
+  }
+      
+    }
+}
+```
+
+#### Sample tilted knockoffs
+
+The code below samples 50 multiple knockoff copies (each time we sample 3 knockoffs).
+
+```{r}
+# directory for putting the data 
+data_dir <- ""
+
+# set number of multiple knockoffs
+B <- 50 
+
+# Tilted knockoffs
+for(diagnosis in diagnoses){
+  for(pheno in phenos){
+    for(y in c(0,1)){
+      for(method in c("me", "mvr")){
+        cat(diagnosis, pheno, method, y,  "\n")
+        
+        r_tilde <- read.table(paste0(data_dir, "ProcessedData/TiltedCov/r_tilde_", pheno, "_", diagnosis,  "_", y, "_" ,method,"_05222025.txt")) %>% as.matrix()
+        
+        mu_tilde <-  as.matrix(read.table(paste0(data_dir, "ProcessedData/TiltedCov/mu_tilde_", pheno, "_", diagnosis,  "_",y, "_", method,"_05222025.txt")))
+        
+        # sample multivariate Gaussian
+        p <- nrow(r_tilde)
+        n <- ncol(mu_tilde)
+        
+        for(b in 1:B){
+          cat(b, ",")
+          if(b %% 10 == 0) cat("\n")
+          
+          xtilde <- matrix(rnorm(n * p), n, p) %*% r_tilde + t(mu_tilde)
+          write.table(xtilde, paste0(data_dir, "ProcessedData/Knockoffs/xtilde_", diagnosis, "_", pheno, "_", y, "_", method,"_", b, ".txt"))
+        }
+      }
+    }
+  }
+}
+
+```
+
+#### Compute knockoff selection for each phenotype
+
+```{r}
+# set number of multiple knockoffs
+B <- 50
+
+# FDR threshold 
+q <- 0.3 
+
+# Tilted Knockoff 
+selection_tilted <- list()
+stat_tilted <- list()
+
+snp_names <- read.table(paste0(data_dir, "ProcessedData/Data/snp_to_keep_0318.txt"), header = F)[,1]
+for(pheno in phenos[ind]){
+  cat(pheno, "\n")
+  
+  data <- read.table(paste0(data_dir, "ProcessedData/PhenoData/", pheno, "_0318.txt"), header = T)
+  
+  for(method in c("me", "mvr")){
+    cat(pheno, method, ":\n")
+    
+    new_selections <- list()
+    new_stats <- list()
+    
+    X <- NULL
+    Y <- NULL
+    for(diagnosis in diagnoses){
+      for(y in c(0, 1)){
+        dat_new <- data %>% 
+          filter(DX == diagnosis) %>% 
+          filter(.data[[pheno]] == y) %>% 
+          select(-c(PaisaID, DX))
+        
+        y_new <- pull(dat_new, {{pheno}})
+        Y <- c(Y, y_new)
+        x_new <- select(dat_new, -{{pheno}})
+        X <- rbind(X, x_new)
+      }
+    }
+    X <- as.matrix(X)
+    
+    for(b in 1:B){
+      XTilde <- NULL
+      for(diagnosis in diagnoses){
+        for(y in c(0, 1)){
+          xtilde_new <- read.table(paste0(data_dir, "ProcessedData/Knockoffs/xtilde_", diagnosis, "_", pheno, "_", y, "_",method, "_", b, ".txt"))
+          XTilde <- rbind(XTilde, xtilde_new)
+        }
+      }
+      XTilde <- as.matrix(XTilde)
+      new_selection <- select_vars_multi_knockoff(X, XTilde, Y, kappa = 3, q, stat = "lasso_lambda_max_bin")
+      
+      new_selections[[b]] <- snp_names[new_selection$selected]
+      new_stats[[b]] <- new_selection$stat 
+      
+      cat(b, ":", snp_names[new_selection$selected], "\n")
+    }
+    
+    new_name <- paste0(pheno, "_", method)
+    selection_tilted[[new_name]] <- new_selections
+    stat_tilted[[new_name]] <- new_stats
+  }
+}
+
+# save results 
+saveRDS(selection_tilted, file = paste0(data_dir, "ProcessedData/Selection/tilted_knockoff_", ind, ".rds"))
+saveRDS(stat_tilted, file = paste0(data_dir, "ProcessedData/Selection/tilted_stat_", ind, ".rds"))
+```
+
+## Visualize results
+
+Finally, we visualize results of standard knockoff and tilted knockoffs.
+
+We start by extracting selections using either the standard or tilted knockoff method at FDR level $q = 0.3$.
+
+```{r}
+snp_names <- read.table(paste0(data_dir, "Processed/processed_data/snp_to_keep_0318.txt"))$V1
+nsnp <- length(snp_names)
+```
+
+```{r}
+counts <- NULL # count number of times each SNP is selected
+
+for(ind in 1:6){
+  # load selections
+  tiltedko_filename <- paste0(data_dir, "Processed/selection/tilted_knockoff_", ind, ".rds")
+  ko_filename <- paste0(data_dir, "Processed/selection/knockoff_", ind, ".rds")
+  
+  data_tiltedko <- readRDS(tiltedko_filename)
+  data_ko <- readRDS(ko_filename)
+  
+  # count selections 
+  counts_new <- tibble(name = snp_names,
+                 tilted_ko = numeric(nsnp),
+                 ko = numeric(nsnp)) 
+
+  for(name in names(data_tiltedko)){
+    for(j in 1:50){
+      ind_tilted_ko <- sapply(data_tiltedko[[name]][[j]], function(t) which(snp_names == t))
+      ind_ko <- sapply(data_ko[[name]][[j]], function(t) which(snp_names == t))
+      if(length(ind_tilted_ko) > 0) counts_new[ind_tilted_ko, "tilted_ko"] <- counts_new[ind_tilted_ko, "tilted_ko"] + 1
+      if(length(ind_ko) > 0) counts_new[ind_ko, "ko"] <- counts_new[ind_ko, "ko"] + 1
+    }
+  }
+  counts_new <- filter(counts_new, ko > 0 | tilted_ko > 0)
+  counts_new <- mutate(counts_new, pheno = phenos[ind])
+  counts <- bind_rows(counts, counts_new)
+}
+```
+
+For each phenotype, we fit a weighted logistic regression model using the weights inversely proportional to $P(D = d|X, Y)$ estimated before and the selections more than 15 times (out of 100) by either knockoff or tilted knockoff method.
+
+```{r}
+
+B <- 1000
+result <- NULL
+
+thresh <- 20
+for(ind in 3:6){
+  dat <- filter(counts, pheno == phenos[ind]) %>% 
+    filter(tilted_ko > thresh | ko > thresh)
+  
+  selected_snps <- pull(dat, name)
+  data_weights <- read.table(paste0(data_dir, "Processed/est_selection_probs/", phenos[ind], "_weights.txt"), sep = ",")
+  
+  model_data <- select(data_weights, - weight) %>% 
+    select(all_of(c(selected_snps, phenos[ind]))) %>% 
+    mutate_at(vars(matches("X_")), scale) 
+  
+  formula <- paste0(phenos[ind], "~ .")
+
+  fit <- glm(formula, weights = 1/data_weights$weight, data = model_data, family = "binomial")
+  
+  fitted_coef <- matrix(NA, nrow = B, ncol = ncol(model_data) - 1)
+  nn <- nrow(model_data)
+  cat("\n",ind, ": \n")
+  for(b in 1:B){
+    if(b %% 50 == 0) cat(b, ",")
+    
+    index <- sample(1:nn, nn, replace = T)
+    
+    fit_new <- glm(formula, weights = 1/data_weights$weight[index],
+                  data = model_data[index, ], family = "binomial") 
+    
+    fitted_coef[b, ] <- coef(fit_new)[-1]
+  }
+  
+  result_new <- bind_cols(dat, Estimate = coef(fit)[-1], `Std. Error` = apply(fitted_coef, 2, sd))
+  
+  
+  result <- bind_rows(result, result_new)
+}
+
+```
+
+We plot the z-score of each variable versus the ratio of a variable being selected by knockoff versus tilted knockoff. The highlighted variables are those selected for at least 15 times using both methods.
+
+```{r}
+result <- result %>% 
+  mutate(z = abs(Estimate) / `Std. Error`,
+         ratio = ko / tilted_ko) 
+
+result <- result %>% 
+  mutate(Phenotype = case_when(pheno == "ATT_A_Binary"~"Attention (Continuous performance test)",
+                               pheno == "ATT_S_Binary"~"Attention (Continuous performance test)",
+                               pheno == "PS_A_Binary"~"Processing Speed (Digit symbol test)",
+                                pheno == "PS_S_Binary"~"Processing Speed (Digit symbol test)"
+                               ),
+         Measure = case_when(pheno == "ATT_A_Binary"~"Accuracy",
+                          pheno == "ATT_S_Binary"~"Speed",
+                          pheno == "PS_A_Binary"~"Accuracy",
+                          pheno == "PS_S_Binary"~"Speed"
+                                ))
+
+selection <- filter(result, ko > thresh, tilted_ko > thresh)
+```
+
+```{r}
+
+gg <- ggplot() + 
+  geom_point(aes(x = z, y = ratio, color = Phenotype, shape = Measure), data = result, size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  geom_point(aes(x = selection$z, y = selection$ratio), size = 6, color = "#fe3b1f", fill = NA, shape = 21, stroke = 1) +
+  xlab("Z-score (absolute value)") + 
+  ylab("Ratio (KO / Tilted KO)") + 
+  scale_color_manual(values = c( "#1D7AE2", "#F7942E")) + 
+  # annotate("text", x = 0.35, y = 0.25, label = "highlight?", size = 8)
+  theme_bw() + 
+  theme(text = element_text(size = 15), 
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 12))
+
+
+# fig_dir <-  "/work/pi_qianzhao_umass_edu/TiltedKnockoff/ProcessedData/Selection/"
+fig_dir <- paste0(data_dir, "Processed/selection/")
+ggsave(gg, filename = paste0(fig_dir, "nselect_real_07012025.png" ), height = 5, width = 9, unit = "in")
+
+```
+
+## Additional data exploration
+
+### Number of previously identified SNPs
+
+```{r}
+EffectSizeIndexSNPs <- read_delim(paste0(data_dir, "/9KSmall01112024/EffectSizeIndexSNPs.txt"), delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+
+# number of SNPs for each diagnosis
+EffectSizeIndexSNPs %>% 
+  group_by(GWAS_file) %>% 
+  summarize(n())
+
+# number of SNPs that are associated with more than one diagnosis
+EffectSizeIndexSNPs %>% 
+  group_by(sigSNPS) %>% 
+  filter(n() > 1)
+```
+
+### Estimated probability of diagnosis given phenotype and genotype
+
+```{r}
+fig_dir <- "/Users/qianzhao/Google Drive/My Drive/Research/TiltedKnockoff/Tilted knockoff/TiltedKnockoff(05142025)/fig/"
+r2_cohen <- tibble(diagnosis = character(),
+                   pheno = character(),
+                   r2 = numeric())
+diagnoses <- c("BP1", "BP2", "MDD", "SCZ","Control")
+phenos <- c("EID_A_Binary", "EID_S_Binary", "ATT_A_Binary", "ATT_S_Binary", "PS_A_Binary", "PS_S_Binary")
+
+
+for(pheno in c("ATT_A_Binary", "ATT_S_Binary", "PS_A_Binary", "PS_S_Binary")){
+    for(diagnosis in c("BP1", "BP2", "MDD", "SCZ")){
+    dx <- case_when(diagnosis == "BP1"~"Bipolar disorder I",
+                        diagnosis == "BP2"~"Bipolar disorder II",
+                        diagnosis == "MDD"~"Major depressive disorder",
+                        diagnosis == "SCZ"~"Schizophrenia", 
+                        
+                               )
+    phenotype <-  case_when(pheno == "ATT_A_Binary"~"Continuous performance test (accuracy)",
+                        pheno == "ATT_S_Binary"~"Continuous performance test (speed)",
+                        pheno == "PS_A_Binary"~"Digit symbol test (accuracy)",
+                        pheno == "PS_S_Binary"~"Digit symbol test (speed)", 
+                        
+                               )
+
+    data <- read.table(paste0(data_dir, "Processed/est_selection_probs/", diagnosis, "_", pheno, "_05222025.txt"), header = T)
+    coef <- read.table(paste0(data_dir, "Processed/est_selection_probs/coef_long_", diagnosis, "_", pheno, "_05222025.txt"), header = T)
+    
+    data_selected <- select(data, all_of(rownames(coef)[which(coef!=0)[-1]]), "dx")
+      
+    fit <- glm(dx ~ ., data=data_selected, family = "binomial")
+    r2 <- (fit$null.deviance - fit$deviance) / fit$null.deviance
+    
+    new_r2 <- data.frame(
+      diagnosis = diagnosis,
+      pheno = pheno,
+      r2 = r2
+    )
+    
+    r2_cohen <- bind_rows(r2_cohen, new_r2)
+    
+    # create histograms of log-odds with contribution from genotype and phenotype 
+    g <- tibble(pred = fit$linear.predictors - fit$coef[1],
+           pheno = data[,(ncol(data)-1)]) %>% 
+      mutate(pheno = factor(pheno)) %>% 
+     ggplot() + 
+      geom_histogram(aes(x = pred,  fill = pheno),
+                     color = "grey30",
+                     alpha = 0.5, position = "identity", bins = 30 ) + 
+      scale_fill_manual(values = c("#E1BE6A", "#D81B60")) + 
+      xlab("Linear predictor") + 
+      ylab("Frequency") + 
+      labs(fill = phenotype)  + 
+      ggtitle(dx) + 
+      # scale_color_manual(values = c("#E1BE6A", "#1AFF1A")) + 
+      theme_bw() + 
+      theme(text = element_text(size = 18),
+            legend.position="bottom")
+    
+    assign(paste0("g_", diagnosis), g)
+    
+    }
+  g <- ggarrange(g_BP1, g_BP2, g_MDD, g_SCZ, ncol = 2,nrow = 2, common.legend = T, legend="bottom") 
+  
+  ggsave(g, filename = paste0(fig_dir, pheno, ".png" ), height = 10, width = 12, unit = "in")
+}
+
+write.table(r2_cohen, file = "/Users/qianzhao/Google Drive/My Drive/Research/TiltedKnockoff/Tilted knockoff/TiltedKnockoff(05142025)/r2.txt", sep = "\t")
+```
