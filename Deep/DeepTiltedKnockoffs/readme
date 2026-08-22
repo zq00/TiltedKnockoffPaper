@@ -1,0 +1,4 @@
+- net.R: set up deep neural network 
+- utils.R: default parameters for deep tilted knockoffs
+- machine.R: training knockoffs machine
+- stat.R: compute kernel MMD
