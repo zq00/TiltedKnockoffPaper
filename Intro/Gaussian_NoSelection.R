@@ -1,4 +1,4 @@
-# Supplement Fig 2
+# Supplement Fig 3
 # Benchmark: knockoff FDR when there's no selection 
 
 # load source functions 
