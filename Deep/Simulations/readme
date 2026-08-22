@@ -1,0 +1,2 @@
+Source code for simulations in paper Section 5.1.4
+Note: the filenames to load source code to train deep tilted knockoffs is slightly different from the ones in DeepTiltedKnockoffs folder because I've cleaned up the file names and code The functions used are the same. 
