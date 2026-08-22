@@ -1,4 +1,4 @@
-# Fig 2 supplement
+# Fig 3 supplement
 # FDR of standard knockoff when there's no selection
 library(ggplot2)
 library(dplyr)
