@@ -5,4 +5,5 @@
 - SecondOrder: simulation in section 3.1 (second order tilted knockoff with **known** selection parameters) as well as supplement Fig 3.
 - Estimated: simulation in section 3.2 (second order tilted knockoff with **estimated** selection parameters) as well as supplement section 3 (misspecified models and using XGBoost to estimate case/control probability) 
 - Real.qmd: real analysis (paper section 4 and supplement section 6)
-- Supplement: generating tilted knockoff using metropolized knockoffs (Supplement section 5.2)  and deep knockoffs when response is **binary** (Supplement section 5.1.3) 
+- Supplement: generating tilted knockoff using metropolized knockoffs (Supplement section 5.2)  and deep knockoffs when response is **binary** (Supplement section 5.1.3)
+- Deep: source and simulation code for deep tilted knockoffs in Supplement section 5
