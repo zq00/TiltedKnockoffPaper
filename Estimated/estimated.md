@@ -1,0 +1,4 @@
+- estimated.R: simulation in Paper section 3.2 and Supplement section 3.3
+- result_estimated.R: result in supplement section 3.3
+- estimate_pop.R: simulation in Supplement section 3.4
+- result_est_pop.R: result in supplement section 3.4
